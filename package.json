@@ -1,0 +1,15 @@
+{
+  "name": "referral-settlement",
+  "version": "1.0.0",
+  "description": "Referral incentive settlement, shared by kz-referral-cron and backOfficeService",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kz-bms/referral-settlement.git"
+  },
+  "license": "ISC"
+}
