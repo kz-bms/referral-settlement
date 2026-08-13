@@ -60,8 +60,9 @@ async function settleReferral(referralDoc, referralDocId, deps) {
     checkDisableWallet,
     sendReferralFcm,
   });
+  // Callers log the blocked cases themselves — their wording differs and is
+  // grepped in the field.
   if (!referredBy.ref) {
-    logger.info(`ReferredBy ${referralDoc.referredBy} blocked: ${referredBy.status}`);
     return { outcome: OUTCOME.BLOCKED, stage: 'referredBy', status: referredBy.status };
   }
 
