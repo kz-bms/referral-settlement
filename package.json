@@ -11,5 +11,6 @@
     "type": "git",
     "url": "git+https://github.com/kz-bms/referral-settlement.git"
   },
+  "scripts": { "test": "node --test" },
   "license": "ISC"
 }
