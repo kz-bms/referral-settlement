@@ -46,7 +46,9 @@ async function settleReferral(referralDoc, referralDocId, deps) {
 
   const firestoreDb = admin.firestore();
   const adminWalletRef = firestoreDb.collection('super_wallet').doc(adminWalletId);
-  const txnRefId = crypto.randomBytes(3 * 4).toString('hex');
+  // Derived from the referral id, so a retry reuses the same txn doc ids instead
+  // of minting a second pair that looks like an unrelated payment.
+  const txnRefId = txnIdFor(referralDocId);
 
   // The invitee's wallet must exist and be verified before anyone is paid.
   const referredTo = await resolveReferredTo(referralDoc, { firestoreDb, listWallet });
@@ -121,21 +123,57 @@ async function settleReferral(referralDoc, referralDocId, deps) {
     createdAtTimestamp: admin.firestore.Timestamp.now(),
   };
 
-  await debit(adminWalletRef, incentiveUsd, adminTransaction, txnRefId, toFixed);
-  logger.info(`Admin transaction updated. ${txnRefId}`);
+  // Both legs, the approval and the dequeue commit together or not at all. The
+  // platform retries a failed run (failurePolicy: retry), and before this the
+  // money moved outside any transaction with `approved` written afterwards — so
+  // a failure between the two paid the referrer twice.
+  const referralRef = firestoreDb.collection('referral').doc(referralDocId);
+  const paid = await firestoreDb.runTransaction(async (tx) => {
+    // Authoritative check: referralDoc was read by the caller and may be stale.
+    const fresh = await tx.get(referralRef);
+    if (fresh.exists && fresh.data().status === 'approved') return false;
 
-  await credit(referredBy.ref, incentiveUsd, referredByTxn, txnRefId, toFixed);
-  logger.info(`ReferredBy entity transaction updated. ${txnRefId}`);
+    // Every read must precede the writes below.
+    const adminSnap = await tx.get(adminWalletRef);
+    const receiverSnap = await tx.get(referredBy.ref);
+    const adminBalance = toFixed(adminSnap.data().balance);
+    const receiverBalance = toFixed(receiverSnap.data().balance);
+
+    const increment = admin.firestore.FieldValue.increment;
+    tx.update(adminWalletRef, { balance: increment(-incentiveUsd) });
+    tx.update(referredBy.ref, { balance: increment(incentiveUsd) });
+
+    tx.set(adminWalletRef.collection('transactions').doc(txnRefId), {
+      ...adminTransaction,
+      previousBalance: adminBalance,
+    });
+    tx.set(referredBy.ref.collection('transactions').doc(txnRefId), {
+      ...referredByTxn,
+      previousBalance: receiverBalance,
+    });
+
+    tx.set(
+      referralRef,
+      { status: 'approved', txnId: txnRefId, updatedAt: admin.firestore.Timestamp.now() },
+      { merge: true },
+    );
+    tx.delete(firestoreDb.collection('referral_cron').doc(referralDocId));
+
+    return true;
+  });
+
+  if (!paid) return { outcome: OUTCOME.ALREADY_APPROVED };
+
+  logger.info(`Referral settled. ${txnRefId}`);
 
   if (onPaid) await onPaid({ adminWalletId, referredByWalletId: wallet.walletId });
 
-  await firestoreDb.collection('referral').doc(referralDocId).set(
-    { status: 'approved', txnId: txnRefId, updatedAt: admin.firestore.Timestamp.now() },
-    { merge: true },
-  );
-  await firestoreDb.collection('referral_cron').doc(referralDocId).delete();
-
   return { outcome: OUTCOME.PAID, txnId: txnRefId, referredByWalletId: wallet.walletId };
+}
+
+// Stable per referral, same 24-hex shape the random ids had.
+function txnIdFor(referralDocId) {
+  return crypto.createHash('sha256').update(String(referralDocId)).digest('hex').slice(0, 24);
 }
 
 // Returns { ref, status } — ref is null when the referral cannot proceed.
@@ -202,24 +240,6 @@ async function resolveReferredBy(
     }
   }
   return { ref: null, status: referralDoc.status };
-}
-
-async function debit(walletRef, amount, txn, txnRefId, toFixed) {
-  const doc = await walletRef.get();
-  const balance = toFixed(doc.data().balance);
-
-  await walletRef.update({ balance: toFixed(balance - amount) });
-  txn['previousBalance'] = toFixed(balance);
-  await walletRef.collection('transactions').doc(txnRefId).set(txn);
-}
-
-async function credit(walletRef, amount, txn, txnRefId, toFixed) {
-  const doc = await walletRef.get();
-  const balance = toFixed(doc.data().balance);
-
-  await walletRef.update({ balance: toFixed(balance + amount) });
-  txn['previousBalance'] = toFixed(balance);
-  await walletRef.collection('transactions').doc(txnRefId).set(txn);
 }
 
 module.exports = { settleReferral, OUTCOME };

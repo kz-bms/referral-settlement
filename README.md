@@ -61,8 +61,18 @@ originals (`type !== 'retailer' || type !== 'wholesaler'`), so retailer and
 wholesaler wallets are not actually skipped. Left unchanged deliberately —
 fixing it would change who gets paid, which is not a refactor.
 
-## Not yet idempotent
+## Idempotent since 1.0.1
 
-`txnId` is random per attempt and balances are read-then-write rather than
-`FieldValue.increment` inside a transaction. A retry after a partial failure can
-pay twice. That predates this extraction and is the next thing worth fixing.
+Safe to retry, which matters because the cron runs with `failurePolicy: retry`.
+
+- `txnId` is derived from the referral document id, so a retry reuses the same
+  transaction documents instead of minting a second pair.
+- Both legs, the `approved` flag and the `referral_cron` delete commit in one
+  `runTransaction`, with balances moved by `FieldValue.increment`.
+- The status is re-read **inside** that transaction. `referralDoc` comes from the
+  caller and may be stale, so its `status` field cannot be trusted on a retry —
+  a second attempt returns `alreadyApproved` and moves no money.
+
+Before 1.0.1 the money moved outside any transaction with `approved` written
+afterwards, so a failure between the two paid the referrer twice under two
+unrelated random txnIds.
