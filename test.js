@@ -68,7 +68,7 @@ function makeAdmin(seed = {}) {
 const verifiedWallet = (over = {}) => ({
   type: 'user',
   walletId: 'W_TO',
-  kyc: { isVerified: true, mobile: '1', region: { iso2: 'US', name: 'United States', currencyAbbreviation: 'USD' } },
+  kyc: { isVerified: true, isMobileVerified: true, mobile: '1', region: { iso2: 'US', name: 'United States', currencyAbbreviation: 'USD' } },
   disableWallet: false,
   walletRefId: 'R', displayName: 'D', email: 'e@x', imageUrl: 'i',
   ...over,
@@ -109,6 +109,35 @@ test('referredTo unverified blocks as pending', async () => {
   assert.equal(r.stage, 'referredTo');
   assert.equal(r.status, 'pending');
   assert.equal(writes.length, 0, 'caller owns persistence, not the module');
+});
+
+test('referredTo approved without mobile OTP blocks as pending', async () => {
+  const { admin, writes } = makeAdmin();
+  const deps = makeDeps(admin, {
+    listWallet: async () => ({ wallets: [verifiedWallet({ kyc: { ...verifiedWallet().kyc, isMobileVerified: false } })] }),
+  });
+  const r = await settleReferral({ status: 'x', referredTo: 'A', referredBy: 'B' }, 'D1', deps);
+
+  assert.equal(r.outcome, OUTCOME.BLOCKED);
+  assert.equal(r.stage, 'referredTo');
+  assert.equal(r.status, 'pending');
+  assert.equal(writes.length, 0);
+});
+
+test('referrer approved without mobile OTP blocks as receiverWalletNotVerified', async () => {
+  const { admin, writes } = makeAdmin();
+  let call = 0;
+  const deps = makeDeps(admin, {
+    listWallet: async () => (++call === 1
+      ? { wallets: [verifiedWallet()] }
+      : { wallets: [verifiedWallet({ kyc: { ...verifiedWallet().kyc, isMobileVerified: false } })] }),
+  });
+  const r = await settleReferral({ status: 'x', referredTo: 'A', referredBy: 'B' }, 'D1', deps);
+
+  assert.equal(r.outcome, OUTCOME.BLOCKED);
+  assert.equal(r.stage, 'referredBy');
+  assert.equal(r.status, 'receiverWalletNotVerified');
+  assert.equal(writes.length, 0, 'no money moves');
 });
 
 test('referredTo disabled blocks as newUserWalletDisabled', async () => {
