@@ -184,7 +184,8 @@ async function resolveReferredTo(referralDoc, { firestoreDb, listWallet }) {
   for (const wallet of array.wallets) {
     if (wallet.type !== 'user') continue;
 
-    if (!wallet.kyc.isVerified || wallet.disableWallet) {
+    // Ready = approved and mobile verified.
+    if (!wallet.kyc.isVerified || !wallet.kyc.isMobileVerified || wallet.disableWallet) {
       return {
         ref: null,
         status: wallet.disableWallet ? 'newUserWalletDisabled' : 'pending',
@@ -211,14 +212,15 @@ async function resolveReferredBy(
     // so retailer/wholesaler wallets are not actually skipped. Left as-is —
     // changing it would change who gets paid.
     if (wallet.type !== 'retailer' || wallet.type !== 'wholesaler') {
+      const ready = wallet.kyc.isVerified && wallet.kyc.isMobileVerified;
       if (
-        !wallet.kyc.isVerified ||
+        !ready ||
         wallet.disableWallet ||
         (await checkDisableWallet(wallet.kyc.region.name))
       ) {
         return {
           ref: null,
-          status: !wallet.kyc.isVerified
+          status: !ready
             ? 'receiverWalletNotVerified'
             : wallet.disableWallet
               ? 'walletDisabled'
