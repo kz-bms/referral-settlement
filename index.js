@@ -15,7 +15,9 @@ const OUTCOME = {
   BLOCKED: 'blocked',
   EXCHANGE_FAILED: 'exchangeFailed',
   NO_INCENTIVE: 'noIncentive',
+  NOT_COUNTED: 'notCounted',
   PAID: 'paid',
+  UNDER_THRESHOLD: 'underThreshold',
 };
 
 /**
@@ -35,6 +37,7 @@ async function settleReferral(referralDoc, referralDocId, deps) {
     sendReferralFcm,
     toFixed,
     logger,
+    getInfluencerThreshold,
     adminWalletId,
     defaultCurrency = 'USD',
     onPaid,
@@ -45,6 +48,13 @@ async function settleReferral(referralDoc, referralDocId, deps) {
   }
 
   const firestoreDb = admin.firestore();
+  const referralRef = firestoreDb.collection('referral').doc(referralDocId);
+
+  // Decided on the referral itself: a queued copy can predate the KYC count.
+  const current = (await referralRef.get()).data() || referralDoc;
+  const threshold = await checkThreshold(current, referralRef, { admin, getInfluencerThreshold });
+  if (threshold.outcome) return threshold;
+
   const adminWalletRef = firestoreDb.collection('super_wallet').doc(adminWalletId);
   // Derived from the referral id, so a retry reuses the same txn doc ids instead
   // of minting a second pair that looks like an unrelated payment.
@@ -127,11 +137,11 @@ async function settleReferral(referralDoc, referralDocId, deps) {
   // platform retries a failed run (failurePolicy: retry), and before this the
   // money moved outside any transaction with `approved` written afterwards — so
   // a failure between the two paid the referrer twice.
-  const referralRef = firestoreDb.collection('referral').doc(referralDocId);
-  const paid = await firestoreDb.runTransaction(async (tx) => {
+  const blockedBy = await firestoreDb.runTransaction(async (tx) => {
     // Authoritative check: referralDoc was read by the caller and may be stale.
     const fresh = await tx.get(referralRef);
-    if (fresh.exists && fresh.data().status === 'approved') return false;
+    if (fresh.exists && fresh.data().status === 'approved') return OUTCOME.ALREADY_APPROVED;
+    if (fresh.exists && fresh.data().underThreshold === true) return OUTCOME.UNDER_THRESHOLD;
 
     // Every read must precede the writes below.
     const adminSnap = await tx.get(adminWalletRef);
@@ -154,21 +164,60 @@ async function settleReferral(referralDoc, referralDocId, deps) {
 
     tx.set(
       referralRef,
-      { status: 'approved', txnId: txnRefId, updatedAt: admin.firestore.Timestamp.now() },
+      { status: 'approved', txnId: txnRefId, updatedAt: admin.firestore.Timestamp.now(), ...threshold.audit },
       { merge: true },
     );
     tx.delete(firestoreDb.collection('referral_cron').doc(referralDocId));
 
-    return true;
+    return null;
   });
 
-  if (!paid) return { outcome: OUTCOME.ALREADY_APPROVED };
+  if (blockedBy) return { outcome: blockedBy };
 
   logger.info(`Referral settled. ${txnRefId}`);
 
   if (onPaid) await onPaid({ adminWalletId, referredByWalletId: wallet.walletId });
 
   return { outcome: OUTCOME.PAID, txnId: txnRefId, referredByWalletId: wallet.walletId };
+}
+
+// An influencer referral is paid only once it has been counted (at the new
+// user's KYC) and its number is above the influencer's current threshold.
+// Returns { outcome } when payment stops, else { audit } — the fields to record
+// on the referral when it is paid. An under-threshold referral is marked so it
+// is never reconsidered.
+async function checkThreshold(referralDoc, referralRef, { admin, getInfluencerThreshold }) {
+  if (referralDoc.underThreshold === true) {
+    return {
+      outcome: OUTCOME.UNDER_THRESHOLD,
+      referralNumber: referralDoc.referralNumber,
+      thresholdAtSettlement: referralDoc.thresholdAtSettlement,
+    };
+  }
+  if (!referralDoc.influencerKzId) return { audit: {} };
+  if (referralDoc.referralNumber == null) return { outcome: OUTCOME.NOT_COUNTED };
+
+  if (typeof getInfluencerThreshold !== 'function') {
+    throw new Error('getInfluencerThreshold is required to settle an influencer referral');
+  }
+  const thresholdAtSettlement = await getInfluencerThreshold(referralDoc.influencerKzId);
+  if (!Number.isFinite(thresholdAtSettlement)) {
+    throw new Error(`No threshold for influencer ${referralDoc.influencerKzId}`);
+  }
+
+  if (referralDoc.referralNumber <= thresholdAtSettlement) {
+    await referralRef.set(
+      { underThreshold: true, thresholdAtSettlement, updatedAt: admin.firestore.Timestamp.now() },
+      { merge: true },
+    );
+    return {
+      outcome: OUTCOME.UNDER_THRESHOLD,
+      referralNumber: referralDoc.referralNumber,
+      thresholdAtSettlement,
+    };
+  }
+
+  return { audit: { underThreshold: false, thresholdAtSettlement } };
 }
 
 // Stable per referral, same 24-hex shape the random ids had.
