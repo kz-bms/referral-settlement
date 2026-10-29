@@ -27,7 +27,9 @@ That logic stays with each caller, which acts on the returned outcome.
 | `blocked` | a wallet check failed. Carries `stage` (`referredTo`/`referredBy`) and the `status` to persist |
 | `exchangeFailed` | currency conversion returned nothing; no money moved |
 | `noIncentive` | the region's `referralIncentive` is not > 0 |
+| `notCounted` | an influencer referral (`influencerKzId`) not yet counted against the threshold, i.e. no `referralNumber`; nothing done |
 | `paid` | settled. Carries `txnId` and `referredByWalletId` |
+| `underThreshold` | an influencer referral whose `referralNumber` is at or below the influencer's threshold. Carries `referralNumber` and `thresholdAtSettlement`; the referral is marked `underThreshold: true` and never paid |
 
 On `paid` it has already written both transaction documents, set the referral to
 `approved`, and deleted the `referral_cron` document.
@@ -49,6 +51,7 @@ Injected, because the two callers have different helper modules.
 | `adminWalletId` | the wallet that funds incentives |
 | `defaultCurrency` | optional, defaults to `USD` |
 | `onPaid({adminWalletId, referredByWalletId})` | optional; the back office re-indexes Solr here |
+| `getInfluencerThreshold(kzId)` | the influencer's current `fixedReferralCount` as a number. Required once an influencer referral is settled; a missing or non-numeric result throws, so nothing is paid |
 
 ## Two things worth knowing
 
@@ -76,3 +79,23 @@ Safe to retry, which matters because the cron runs with `failurePolicy: retry`.
 Before 1.0.1 the money moved outside any transaction with `approved` written
 afterwards, so a failure between the two paid the referrer twice under two
 unrelated random txnIds.
+## Influencer threshold since 1.0.3
+
+An influencer's first `fixedReferralCount` referees are not paid; the incentive
+starts above that. When a referee completes KYC the backend increments the
+influencer's `referralCounter` and stamps the referral with `referralNumber`
+(its `influencerKzId` is stamped when the referral is created).
+
+Settlement compares `referralNumber` with the influencer's threshold **at
+settlement time**, read through `getInfluencerThreshold`:
+
+- not counted yet (no `referralNumber`) → `notCounted`, nothing written
+- `referralNumber <= threshold` → `underThreshold`; the referral is marked
+  `underThreshold: true` with `thresholdAtSettlement` and never reconsidered
+- above it → paid as usual, recording `underThreshold: false` and
+  `thresholdAtSettlement` alongside `approved`
+
+The decision reads the `referral` document, not the caller's copy, because the
+`referral_cron` copy may predate the count. The `underThreshold` flag is checked
+again inside the payment transaction. Statuses are unchanged; there is no
+threshold status.
