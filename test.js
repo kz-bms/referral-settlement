@@ -286,17 +286,12 @@ const funded = () => ({
   'super_wallet/W_TO': { balance: 5 },
 });
 const withThreshold = (n) => ({ getInfluencerThreshold: async () => n });
+const noMoneyMoved = (docs) => {
+  assert.equal(docs.get('super_wallet/KZADMINWALLET000001').balance, 100, 'admin not debited');
+  assert.equal(docs.get('super_wallet/W_TO').balance, 5, 'referrer not credited');
+};
 
-test('referral already marked under the threshold pays nothing', async () => {
-  const { admin, writes } = makeAdmin();
-  const doc = { status: 'pending', influencerKzId: 'INF', referralNumber: 3, underThreshold: true };
-  const r = await settleReferral(doc, 'D1', makeDeps(admin, withThreshold(10)));
-
-  assert.equal(r.outcome, OUTCOME.UNDER_THRESHOLD);
-  assert.equal(writes.length, 0, 'already decided, nothing to write');
-});
-
-test('influencer referral not yet counted at KYC pays nothing', async () => {
+test('influencer referral not yet counted at KYC is left alone', async () => {
   const { admin, writes } = makeAdmin();
   const r = await settleReferral({ status: 'pending', influencerKzId: 'INF' }, 'D1', makeDeps(admin, withThreshold(10)));
 
@@ -304,22 +299,67 @@ test('influencer referral not yet counted at KYC pays nothing', async () => {
   assert.equal(writes.length, 0, 'an uncounted referral would bypass the threshold');
 });
 
-test('influencer referral at or below the threshold is marked and not paid', async () => {
+test('influencer referral at or below the threshold is approved without credit', async () => {
   for (const referralNumber of [3, 10]) {
-    const { admin, docs } = makeAdmin({
+    const { admin, docs, writes } = makeAdmin({
       ...funded(),
       'referral/D1': { status: 'pending', influencerKzId: 'INF', referralNumber },
+      'referral_cron/D1': { status: 'pending' },
     });
     const r = await settleReferral({ status: 'pending' }, 'D1', makeDeps(admin, withThreshold(10)));
 
     assert.equal(r.outcome, OUTCOME.UNDER_THRESHOLD, `referral #${referralNumber}`);
+    assert.equal(r.referralNumber, referralNumber);
     assert.equal(r.thresholdAtSettlement, 10);
-    assert.equal(docs.get('referral/D1').underThreshold, true, 'marked so it is never reconsidered');
-    assert.equal(docs.get('referral/D1').thresholdAtSettlement, 10, 'threshold kept for audit');
-    assert.equal(docs.get('referral/D1').status, 'pending', 'no threshold status');
-    assert.equal(docs.get('super_wallet/KZADMINWALLET000001').balance, 100, 'admin not debited');
-    assert.equal(docs.get('super_wallet/W_TO').balance, 5, 'referrer not credited');
+
+    const referral = docs.get('referral/D1');
+    assert.equal(referral.status, 'approved', 'same status as a paid referral');
+    assert.equal(referral.underThreshold, true, 'flag for reconciliation');
+    assert.equal(referral.thresholdAtSettlement, 10);
+    assert.equal(referral.txnId, undefined, 'no transaction');
+    assert.equal(docs.has('referral_cron/D1'), false, 'dequeued');
+    assert.ok(!writes.some((w) => w.path.includes('/transactions/')), 'no transaction docs');
+    noMoneyMoved(docs);
   }
+});
+
+test('under-threshold referral waits for the referee wallet like any other', async () => {
+  const { admin, docs } = makeAdmin({
+    ...funded(),
+    'referral/D1': { status: 'pending', influencerKzId: 'INF', referralNumber: 3 },
+  });
+  const deps = makeDeps(admin, {
+    ...withThreshold(10),
+    listWallet: async () => ({ wallets: [verifiedWallet({ kyc: { ...verifiedWallet().kyc, isMobileVerified: false } })] }),
+  });
+  const r = await settleReferral({ status: 'pending', referredTo: 'A', referredBy: 'INF' }, 'D1', deps);
+
+  assert.equal(r.outcome, OUTCOME.BLOCKED);
+  assert.equal(r.stage, 'referredTo');
+  assert.equal(docs.get('referral/D1').status, 'pending', 'not approved before the referee is ready');
+  assert.equal(docs.get('referral/D1').underThreshold, undefined);
+});
+
+test('under-threshold referral waits for the referrer wallet like any other', async () => {
+  const { admin, docs } = makeAdmin({
+    ...funded(),
+    'referral/D1': { status: 'pending', influencerKzId: 'INF', referralNumber: 3 },
+  });
+  let reminded = false;
+  const deps = makeDeps(admin, {
+    ...withThreshold(10),
+    // The referee is ready; the influencer has no wallet yet.
+    listWallet: async (kzId) => ({ wallets: kzId === 'A' ? [verifiedWallet()] : [] }),
+    sendReferralFcm: async () => { reminded = true; },
+  });
+  const r = await settleReferral({ status: 'pending', referredTo: 'A', referredBy: 'INF' }, 'D1', deps);
+
+  assert.equal(r.outcome, OUTCOME.BLOCKED);
+  assert.equal(r.stage, 'referredBy');
+  assert.equal(r.status, 'receiverWalletNotCreated', 'same status as a normal referral');
+  assert.equal(reminded, true, 'same "create a wallet" reminder as a normal referral');
+  assert.equal(docs.get('referral/D1').status, 'pending', 'not approved yet');
+  assert.equal(docs.get('referral/D1').underThreshold, undefined, 'not decided yet');
 });
 
 test('influencer referral above the threshold pays and records the threshold', async () => {
@@ -333,6 +373,7 @@ test('influencer referral above the threshold pays and records the threshold', a
   assert.equal(docs.get('referral/D1').status, 'approved');
   assert.equal(docs.get('referral/D1').underThreshold, false);
   assert.equal(docs.get('referral/D1').thresholdAtSettlement, 10);
+  assert.ok(docs.get('referral/D1').txnId);
 });
 
 test('threshold 0 pays the first referral', async () => {
@@ -354,20 +395,20 @@ test('queued copy counted after it was queued uses the count on the referral', a
   const r = await settleReferral({ status: 'pending', influencerKzId: 'INF' }, 'D1', makeDeps(admin, withThreshold(10)));
 
   assert.equal(r.outcome, OUTCOME.UNDER_THRESHOLD);
-  assert.equal(docs.get('super_wallet/W_TO').balance, 5, 'referrer not credited');
+  noMoneyMoved(docs);
 });
 
-test('stale queued copy is not paid once the referral is under the threshold', async () => {
+test('stale queued copy is not settled again once the referral was approved under the threshold', async () => {
   const { admin, docs } = makeAdmin({
     ...funded(),
-    'referral/D1': { status: 'pending', influencerKzId: 'INF', referralNumber: 3, underThreshold: true },
+    'referral/D1': { status: 'approved', influencerKzId: 'INF', referralNumber: 3, underThreshold: true },
   });
-  // The referral_cron copy carries no threshold fields; only the referral does.
-  const r = await settleReferral({ status: 'pending' }, 'D1', makeDeps(admin));
+  // The referral_cron copy still says pending.
+  const r = await settleReferral({ status: 'pending', influencerKzId: 'INF', referralNumber: 3 }, 'D1', makeDeps(admin, withThreshold(0)));
 
-  assert.equal(r.outcome, OUTCOME.UNDER_THRESHOLD);
-  assert.equal(docs.get('super_wallet/KZADMINWALLET000001').balance, 100, 'admin not debited');
-  assert.equal(docs.get('super_wallet/W_TO').balance, 5, 'referrer not credited');
+  assert.equal(r.outcome, OUTCOME.ALREADY_APPROVED, 'the in-transaction re-read wins');
+  assert.equal(docs.get('referral/D1').underThreshold, true, 'not flipped');
+  noMoneyMoved(docs);
 });
 
 test('influencer referral without a threshold lookup throws instead of paying', async () => {
@@ -378,5 +419,5 @@ test('influencer referral without a threshold lookup throws instead of paying', 
 
   await assert.rejects(settleReferral({ status: 'pending' }, 'D1', makeDeps(admin)));
   await assert.rejects(settleReferral({ status: 'pending' }, 'D1', makeDeps(admin, withThreshold(null))));
-  assert.equal(docs.get('super_wallet/W_TO').balance, 5, 'referrer not credited');
+  noMoneyMoved(docs);
 });

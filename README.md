@@ -29,7 +29,7 @@ That logic stays with each caller, which acts on the returned outcome.
 | `noIncentive` | the region's `referralIncentive` is not > 0 |
 | `notCounted` | an influencer referral (`influencerKzId`) not yet counted against the threshold, i.e. no `referralNumber`; nothing done |
 | `paid` | settled. Carries `txnId` and `referredByWalletId` |
-| `underThreshold` | an influencer referral whose `referralNumber` is at or below the influencer's threshold. Carries `referralNumber` and `thresholdAtSettlement`; the referral is marked `underThreshold: true` and never paid |
+| `underThreshold` | an influencer referral whose `referralNumber` is at or below the influencer's threshold, at the point a normal referral would be credited. Approved like any referral but **not credited**: `status: approved`, `underThreshold: true`, `thresholdAtSettlement`, no `txnId`, dequeued. Carries `referralNumber` and `thresholdAtSettlement` |
 
 On `paid` it has already written both transaction documents, set the referral to
 `approved`, and deleted the `referral_cron` document.
@@ -81,21 +81,28 @@ afterwards, so a failure between the two paid the referrer twice under two
 unrelated random txnIds.
 ## Influencer threshold since 1.0.3
 
-An influencer's first `fixedReferralCount` referees are not paid; the incentive
-starts above that. When a referee completes KYC the backend increments the
-influencer's `referralCounter` and stamps the referral with `referralNumber`
-(its `influencerKzId` is stamped when the referral is created).
+Since 1.0.4 an under-threshold referral is approved without credit; 1.0.3
+left it `pending`.
 
-Settlement compares `referralNumber` with the influencer's threshold **at
-settlement time**, read through `getInfluencerThreshold`:
+An influencer's first `fixedReferralCount` referees earn no incentive; the
+normal incentive starts above that. When a referee completes KYC the backend
+increments the influencer's `referralCounter` and stamps the referral with
+`referralNumber` (its `influencerKzId` is stamped when the referral is created).
+
+The referral otherwise goes through the normal process, including both wallet
+checks and their statuses. Where a normal referral would be credited,
+`referralNumber` is compared with the influencer's threshold
+**at settlement time**, read through `getInfluencerThreshold`:
 
 - not counted yet (no `referralNumber`) → `notCounted`, nothing written
-- `referralNumber <= threshold` → `underThreshold`; the referral is marked
-  `underThreshold: true` with `thresholdAtSettlement` and never reconsidered
+- `referralNumber <= threshold` → `underThreshold`: approved without credit —
+  `status: approved`, `underThreshold: true`, `thresholdAtSettlement`, no
+  transaction.
 - above it → paid as usual, recording `underThreshold: false` and
   `thresholdAtSettlement` alongside `approved`
 
+For reconciliation: approved with a `txnId` was credited; approved with
+`underThreshold: true` was not. There is no threshold status.
+
 The decision reads the `referral` document, not the caller's copy, because the
-`referral_cron` copy may predate the count. The `underThreshold` flag is checked
-again inside the payment transaction. Statuses are unchanged; there is no
-threshold status.
+`referral_cron` copy may predate the count.

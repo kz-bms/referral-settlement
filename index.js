@@ -49,12 +49,6 @@ async function settleReferral(referralDoc, referralDocId, deps) {
 
   const firestoreDb = admin.firestore();
   const referralRef = firestoreDb.collection('referral').doc(referralDocId);
-
-  // Decided on the referral itself: a queued copy can predate the KYC count.
-  const current = (await referralRef.get()).data() || referralDoc;
-  const threshold = await checkThreshold(current, referralRef, { admin, getInfluencerThreshold });
-  if (threshold.outcome) return threshold;
-
   const adminWalletRef = firestoreDb.collection('super_wallet').doc(adminWalletId);
   // Derived from the referral id, so a retry reuses the same txn doc ids instead
   // of minting a second pair that looks like an unrelated payment.
@@ -66,6 +60,10 @@ async function settleReferral(referralDoc, referralDocId, deps) {
     return { outcome: OUTCOME.BLOCKED, stage: 'referredTo', status: referredTo.status };
   }
 
+  // Read from the referral itself: a queued copy can be stale or predate the KYC count.
+  const current = (await referralRef.get()).data() || referralDoc;
+  if (current.status === 'approved') return { outcome: OUTCOME.ALREADY_APPROVED };
+
   const referredBy = await resolveReferredBy(referralDoc, {
     firestoreDb,
     listWallet,
@@ -76,6 +74,14 @@ async function settleReferral(referralDoc, referralDocId, deps) {
   // grepped in the field.
   if (!referredBy.ref) {
     return { outcome: OUTCOME.BLOCKED, stage: 'referredBy', status: referredBy.status };
+  }
+
+  // Decided only where a normal referral would be paid, so an under-threshold
+  // one goes through exactly the same wallet checks and statuses.
+  const threshold = await checkThreshold(current, getInfluencerThreshold);
+  if (threshold.outcome) return threshold;
+  if (threshold.underThreshold) {
+    return approveUnderThreshold(referralRef, referralDocId, threshold, { admin, firestoreDb, logger });
   }
 
   const wallet = referredBy.wallet;
@@ -141,7 +147,6 @@ async function settleReferral(referralDoc, referralDocId, deps) {
     // Authoritative check: referralDoc was read by the caller and may be stale.
     const fresh = await tx.get(referralRef);
     if (fresh.exists && fresh.data().status === 'approved') return OUTCOME.ALREADY_APPROVED;
-    if (fresh.exists && fresh.data().underThreshold === true) return OUTCOME.UNDER_THRESHOLD;
 
     // Every read must precede the writes below.
     const adminSnap = await tx.get(adminWalletRef);
@@ -181,19 +186,12 @@ async function settleReferral(referralDoc, referralDocId, deps) {
   return { outcome: OUTCOME.PAID, txnId: txnRefId, referredByWalletId: wallet.walletId };
 }
 
-// An influencer referral is paid only once it has been counted (at the new
-// user's KYC) and its number is above the influencer's current threshold.
-// Returns { outcome } when payment stops, else { audit } — the fields to record
-// on the referral when it is paid. An under-threshold referral is marked so it
-// is never reconsidered.
-async function checkThreshold(referralDoc, referralRef, { admin, getInfluencerThreshold }) {
-  if (referralDoc.underThreshold === true) {
-    return {
-      outcome: OUTCOME.UNDER_THRESHOLD,
-      referralNumber: referralDoc.referralNumber,
-      thresholdAtSettlement: referralDoc.thresholdAtSettlement,
-    };
-  }
+// An influencer referral is credited only once it has been counted (at the
+// new user's KYC) and its number is above the influencer's current threshold.
+// Returns { outcome } when it cannot be decided yet, { underThreshold, ... }
+// when it is approved without credit, else { audit } — the fields recorded on
+// the referral when it is paid.
+async function checkThreshold(referralDoc, getInfluencerThreshold) {
   if (!referralDoc.influencerKzId) return { audit: {} };
   if (referralDoc.referralNumber == null) return { outcome: OUTCOME.NOT_COUNTED };
 
@@ -206,18 +204,36 @@ async function checkThreshold(referralDoc, referralRef, { admin, getInfluencerTh
   }
 
   if (referralDoc.referralNumber <= thresholdAtSettlement) {
-    await referralRef.set(
-      { underThreshold: true, thresholdAtSettlement, updatedAt: admin.firestore.Timestamp.now() },
-      { merge: true },
-    );
-    return {
-      outcome: OUTCOME.UNDER_THRESHOLD,
-      referralNumber: referralDoc.referralNumber,
-      thresholdAtSettlement,
-    };
+    return { underThreshold: true, referralNumber: referralDoc.referralNumber, thresholdAtSettlement };
   }
 
   return { audit: { underThreshold: false, thresholdAtSettlement } };
+}
+
+// Approves an under-threshold referral like any other, without a transaction or
+// any credit; `underThreshold` is what tells it apart for reconciliation.
+async function approveUnderThreshold(referralRef, referralDocId, threshold, { admin, firestoreDb, logger }) {
+  const { referralNumber, thresholdAtSettlement } = threshold;
+
+  const approved = await firestoreDb.runTransaction(async (tx) => {
+    const fresh = await tx.get(referralRef);
+    if (fresh.exists && fresh.data().status === 'approved') return false;
+
+    tx.set(
+      referralRef,
+      { status: 'approved', underThreshold: true, thresholdAtSettlement, updatedAt: admin.firestore.Timestamp.now() },
+      { merge: true },
+    );
+    tx.delete(firestoreDb.collection('referral_cron').doc(referralDocId));
+
+    return true;
+  });
+
+  if (!approved) return { outcome: OUTCOME.ALREADY_APPROVED };
+
+  logger.info(`Referral approved under threshold, not credited. ${referralDocId} (#${referralNumber} of ${thresholdAtSettlement})`);
+
+  return { outcome: OUTCOME.UNDER_THRESHOLD, referralNumber, thresholdAtSettlement };
 }
 
 // Stable per referral, same 24-hex shape the random ids had.
